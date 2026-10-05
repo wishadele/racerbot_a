@@ -10,12 +10,12 @@ GapFinderNode::GapFinderNode() : Node("gap_finder_node")
     this->declare_parameter("car_width_extended", 0.55);
     this->declare_parameter("disparity_threshold", 1.5);
     this->declare_parameter("fov_half_angle_deg", 90.0);
-    this->declare_parameter("minimum_gap_threshold", 0.001);
     this->declare_parameter("obstacle_distance", 2.0);              // m: something this close in our lane counts as "blocked"
     this->declare_parameter("obstacle_edge_jump", 0.5);             // m: range jump between neighbouring beams that marks an object's edge
     this->declare_parameter("obstacle_max_width", 0.8);             // m: wider than this is a wall/corner, not an obstacle
     this->declare_parameter("obstacle_min_target_angle_deg", 8.0);  // target must be off-center for this to count
     this->declare_parameter("obstacle_hold_frames", 8);             // keep obstacle mode on this many scans after last detection
+    this->declare_parameter("minimum_gap_threshold", 0.1);
     // Read into member variables
     max_lidar_range_ = this->get_parameter("max_lidar_range").as_double();
     car_width_extended_ = this->get_parameter("car_width_extended").as_double();
@@ -169,7 +169,7 @@ void GapFinderNode::extend_obstacles(const sensor_msgs::msg::LaserScan::ConstSha
 
             if (closer_range > 1e-3f) // avoid divide-by-zero / near-zero blowup
             {
-                double theta = car_width_extended_ / closer_range;
+                double theta = 2.0 * std::atan2(car_width_extended_ / 2.0, closer_range);
                 theta = std::min(theta, M_PI); // also cap max bubble angle as a safety net
 
                 size_t index_increment = static_cast<size_t>((theta / scan_msg->angle_increment) / 2.0);
