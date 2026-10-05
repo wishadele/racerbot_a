@@ -11,14 +11,23 @@ GapFinderNode::GapFinderNode() : Node("gap_finder_node")
     this->declare_parameter("disparity_threshold", 1.5);
     this->declare_parameter("fov_half_angle_deg", 90.0);
     this->declare_parameter("minimum_gap_threshold", 0.001);
-
+    this->declare_parameter("obstacle_distance", 2.0);              // m: something this close in our lane counts as "blocked"
+    this->declare_parameter("obstacle_edge_jump", 0.5);             // m: range jump between neighbouring beams that marks an object's edge
+    this->declare_parameter("obstacle_max_width", 0.8);             // m: wider than this is a wall/corner, not an obstacle
+    this->declare_parameter("obstacle_min_target_angle_deg", 8.0);  // target must be off-center for this to count
+    this->declare_parameter("obstacle_hold_frames", 8);             // keep obstacle mode on this many scans after last detection
     // Read into member variables
     max_lidar_range_ = this->get_parameter("max_lidar_range").as_double();
     car_width_extended_ = this->get_parameter("car_width_extended").as_double();
     disparity_threshold_ = this->get_parameter("disparity_threshold").as_double();
     fov_half_angle_ = this->get_parameter("fov_half_angle_deg").as_double() * M_PI / 180.0;
     minimum_gap_threshold_ = this->get_parameter("minimum_gap_threshold").as_double();
-
+    obstacle_distance_ = this->get_parameter("obstacle_distance").as_double();
+    obstacle_edge_jump_ = this->get_parameter("obstacle_edge_jump").as_double();
+    obstacle_max_width_ = this->get_parameter("obstacle_max_width").as_double();
+    obstacle_min_target_angle_ = this->get_parameter("obstacle_min_target_angle_deg").as_double() * M_PI / 180.0;
+    obstacle_hold_frames_ = this->get_parameter("obstacle_hold_frames").as_int();
+    
     laser_scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
         "scan",
         10,
@@ -30,6 +39,7 @@ GapFinderNode::GapFinderNode() : Node("gap_finder_node")
 void GapFinderNode::lidar_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg)
 {
     auto ranges = preprocess_lidar(scan_msg);
+    const vector<float> raw_ranges = ranges;   // [NEW] copy before extension, so object widths stay physical
     extend_obstacles(scan_msg, ranges);
 
     auto gap = find_furthest_gap(scan_msg, ranges);
@@ -54,7 +64,74 @@ void GapFinderNode::lidar_callback(const sensor_msgs::msg::LaserScan::ConstShare
     gap_msg.target_angle = scan_msg->angle_min + scan_msg->angle_increment * furthest_point;
     gap_msg.target_range = ranges[furthest_point];
 
+    // [NEW] obstacle vs. normal turn
+    gap_msg.obstacle_ahead = update_obstacle_state(
+        detect_obstacle(scan_msg, raw_ranges, gap_msg.target_angle));
+
     gap_pub_->publish(gap_msg);
+}
+
+bool GapFinderNode::detect_obstacle(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg,
+                                    const vector<float> &raw, double target_angle)
+{
+    const int n = static_cast<int>(raw.size());
+    if (n == 0) return false;
+
+    auto range_at = [&](int i) -> float {
+        const float r = raw[i];
+        return (std::isfinite(r) && r > 0.05f) ? r : static_cast<float>(max_lidar_range_);
+    };
+    auto angle_at = [&](int i) -> double {
+        return scan_msg->angle_min + scan_msg->angle_increment * i;
+    };
+    const double scan_limit = std::min(fov_half_angle_, M_PI / 2.0);
+
+    // 1. Closest reading inside the car's lane (lateral offset < half the extended car width)
+    const double half_width = car_width_extended_ / 2.0;
+    int closest = -1;
+    float forward_min = std::numeric_limits<float>::max();
+    for (int i = 0; i < n; ++i)
+    {
+        const double a = angle_at(i);
+        if (std::abs(a) >= scan_limit) continue;
+        const float r = range_at(i);
+        if (std::abs(r * std::sin(a)) > half_width) continue;
+        if (r < forward_min) { forward_min = r; closest = i; }
+    }
+    if (closest < 0 || forward_min > obstacle_distance_) return false;   // clear ahead: normal driving
+
+    // 2. Walk outward from the closest point until the range jumps away (the object's edge).
+    //    Running off the scan without a jump means the "object" is a wall.
+    auto find_edge = [&](int dir) -> int {
+        int j = closest;
+        while (true)
+        {
+            const int next = j + dir;
+            if (next < 0 || next >= n || std::abs(angle_at(next)) >= scan_limit) return -1;
+            if (range_at(next) - range_at(j) > obstacle_edge_jump_) return j;   // j = last point on the object
+            j = next;
+        }
+    };
+
+    const int left_edge = find_edge(+1);
+    const int right_edge = find_edge(-1);
+    if (left_edge < 0 || right_edge < 0) return false;   // blockage joins a wall: treat as a turn
+
+    const double y_left = range_at(left_edge) * std::sin(angle_at(left_edge));
+    const double y_right = range_at(right_edge) * std::sin(angle_at(right_edge));
+    if (y_left - y_right > obstacle_max_width_) return false;   // too wide for one obstacle
+
+    return std::abs(target_angle) > obstacle_min_target_angle_;
+}
+
+bool GapFinderNode::update_obstacle_state(bool detected)
+{
+    if (detected)
+        obstacle_hold_counter_ = obstacle_hold_frames_;
+    else if (obstacle_hold_counter_ > 0)
+        --obstacle_hold_counter_;
+
+    return obstacle_hold_counter_ > 0;
 }
 
 vector<float> GapFinderNode::preprocess_lidar(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg)
